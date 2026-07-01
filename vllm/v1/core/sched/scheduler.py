@@ -242,6 +242,8 @@ class Scheduler(SchedulerInterface):
                 self.num_lookahead_tokens = self.num_spec_tokens
             if speculative_config.uses_draft_model():
                 self.num_lookahead_tokens = self.num_spec_tokens
+            if speculative_config.use_sparse_attn():
+                self.num_lookahead_tokens = self.num_spec_tokens
             if speculative_config.use_dflash():
                 # DFlash requires an extra lookahead slot since it uses in-fill-style
                 # decoding instead of standard next-token sampling, so it has a query

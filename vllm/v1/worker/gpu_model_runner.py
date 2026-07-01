@@ -182,6 +182,7 @@ from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
 from vllm.v1.spec_decode.gemma4 import Gemma4Proposer
+from vllm.v1.spec_decode.sparse_attn import SparseAttnProposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.ngram_proposer_gpu import (
@@ -556,6 +557,7 @@ class GPUModelRunner(
                 | ExtractHiddenStatesProposer
                 | Gemma4Proposer
                 | Step3p5MTPProposer
+                | SparseAttnProposer
             )
             if self.speculative_config.method == "custom_class":
                 self.drafter = create_custom_proposer(  # type: ignore[assignment]
@@ -597,6 +599,8 @@ class GPUModelRunner(
                 self.use_aux_hidden_state_outputs = True
             elif self.speculative_config.method == "suffix":
                 self.drafter = SuffixDecodingProposer(self.vllm_config)
+            elif self.speculative_config.use_sparse_attn():
+                self.drafter = SparseAttnProposer(self.vllm_config, self.device, self)
             elif self.speculative_config.use_eagle():
                 self.drafter = EagleProposer(self.vllm_config, self.device, self)
                 if self.speculative_config.method == "eagle3":
@@ -4517,17 +4521,20 @@ class GPUModelRunner(
                 spec_config.use_eagle()
                 or spec_config.uses_draft_model()
                 or spec_config.uses_extract_hidden_states()
+                or spec_config.use_sparse_attn()
             ) and not spec_config.disable_padded_drafter_batch
             if use_gpu_toks:
-                # EAGLE/DraftModel speculative decoding can use the GPU sampled tokens
-                # as inputs, and does not need to wait for bookkeeping to finish.
+                # EAGLE/DraftModel/SparseAttn speculative decoding can use the
+                # GPU sampled tokens as inputs, and does not need to wait for
+                # bookkeeping to finish.
                 assert isinstance(
                     self.drafter,
                     EagleProposer
                     | DFlashProposer
                     | DraftModelProposer
                     | ExtractHiddenStatesProposer
-                    | Gemma4Proposer,
+                    | Gemma4Proposer
+                    | SparseAttnProposer,
                 )
                 sampled_token_ids = sampler_output.sampled_token_ids
                 if input_fits_in_drafter:
@@ -5004,6 +5011,57 @@ class GPUModelRunner(
                 next_token_ids, valid_sampled_tokens_count
             )
 
+        elif spec_config.use_sparse_attn():
+            assert isinstance(self.drafter, SparseAttnProposer)
+
+            # TODO: Support disable_padded_drafter_batch for sparse_attn.
+            assert not spec_config.disable_padded_drafter_batch
+            assert isinstance(sampled_token_ids, torch.Tensor), (
+                "sampled_token_ids should be a torch.Tensor for sparse_attn."
+            )
+            next_token_ids, valid_sampled_tokens_count = (
+                self.drafter.prepare_next_token_ids_padded(
+                    sampled_token_ids,
+                    self.requests,
+                    self.input_batch,
+                    self.discard_request_mask.gpu,
+                )
+            )
+            self._copy_valid_sampled_token_count(
+                next_token_ids, valid_sampled_tokens_count
+            )
+
+            num_rejected_tokens_gpu = None
+            if spec_decode_metadata is None:
+                token_indices_to_sample = None
+            else:
+                (
+                    common_attn_metadata,
+                    token_indices_to_sample,
+                    num_rejected_tokens_gpu,
+                ) = self.drafter.prepare_inputs_padded(
+                    common_attn_metadata,
+                    spec_decode_metadata,
+                    valid_sampled_tokens_count,
+                )
+
+            # TODO: Support multimodal embed inputs for sparse_attn.
+            mm_embed_inputs = None
+
+            draft_token_ids = self.drafter.propose(
+                next_token_ids=next_token_ids,
+                token_indices_to_sample=token_indices_to_sample,
+                sampling_metadata=sampling_metadata,
+                common_attn_metadata=common_attn_metadata,
+                mm_embed_inputs=mm_embed_inputs,
+                num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+                slot_mappings=slot_mappings,
+            )
+            if hasattr(self.drafter, "take_last_draft_probs"):
+                draft_probs = self.drafter.take_last_draft_probs()
+                if draft_probs is not None:
+                    self._draft_probs = draft_probs
+                    self._draft_prob_req_ids = self.input_batch.req_ids.copy()
         elif (
             spec_config.use_eagle()
             or spec_config.use_dflash()
@@ -6013,6 +6071,15 @@ class GPUModelRunner(
                     is_graph_capturing=is_graph_capturing,
                     slot_mappings=slot_mappings,
                 )
+            elif self.speculative_config and self.speculative_config.use_sparse_attn():
+                assert isinstance(self.drafter, SparseAttnProposer)
+                self.drafter.dummy_run(
+                    num_tokens,
+                    use_cudagraphs=not self.speculative_config.enforce_eager,
+                    is_graph_capturing=is_graph_capturing,
+                    attn_metadata=attn_metadata,
+                    slot_mappings=slot_mappings,
+                )
 
         # We register layerwise NVTX hooks here after the first dynamo tracing is
         # done to avoid nvtx operations in hook functions being traced by
@@ -6941,6 +7008,10 @@ class GPUModelRunner(
                 | Gemma4Proposer,
             )
             self.drafter.initialize_cudagraph_keys(cudagraph_mode)
+        elif self.speculative_config \
+                and self.speculative_config.use_sparse_attn():
+            assert isinstance(self.drafter, SparseAttnProposer)
+            self.drafter.initialize_cudagraph_keys(cudagraph_mode)
 
     def calculate_reorder_batch_threshold(self) -> None:
         """
@@ -7352,6 +7423,11 @@ class GPUModelRunner(
             assert isinstance(self.drafter, ExtractHiddenStatesProposer)
             # validate all draft model layers belong to the same kv cache
             # group
+            self.drafter.validate_same_kv_cache_group(kv_cache_config)
+        elif self.speculative_config and self.speculative_config.use_sparse_attn():
+            assert isinstance(self.drafter, SparseAttnProposer)
+            # For SparseAttn self-speculation, validate all target model layers
+            # belong to the same kv cache group.
             self.drafter.validate_same_kv_cache_group(kv_cache_config)
 
         if has_kv_transfer_group() and not is_profiling:

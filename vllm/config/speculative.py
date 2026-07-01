@@ -64,6 +64,7 @@ SpeculativeMethod = Literal[
     "draft_model",
     "suffix",
     "custom_class",
+    "sparse_attn",
     EagleModelTypes,
     NgramGPUTypes,
 ]
@@ -144,6 +145,18 @@ class SpeculativeConfig:
     prompt_lookup_min: int | None = Field(default=None, ge=1)
     """Minimum size of ngram token window when using Ngram proposer, if
     provided. Defaults to 1."""
+
+    # Self-speculative decoding with sparse attention
+    sparse_attn_algorithm: Literal["streamingllm"] = "streamingllm"
+    """The KV sparsity pattern used by self-speculative decoding."""
+
+    sparse_attn_ratio: float = Field(default=0.05, gt=0, lt=1)
+    """The ratio of tokens to attend to in sparse attention. Only used when
+    sparse_attn_algorithm is specified. Defaults to 0.05."""
+
+    sparse_attn_min_tokens: int = Field(default=256, gt=0)
+    """The minimum number of tokens to attend to in sparse attention. Only used
+    when sparse_attn_algorithm is specified. Defaults to 256."""
 
     # Alternative drafting strategies
     parallel_drafting: bool = False
@@ -614,6 +627,8 @@ class SpeculativeConfig:
                 self.model = "suffix"
             elif self.method == "extract_hidden_states":
                 self.model = "extract_hidden_states"
+            elif self.method == "sparse_attn":
+                self.model = "sparse_attn"
             elif self.method == "custom_class":
                 # method was set explicitly, but model should already contain the
                 # custom module path. If not, this is a configuration error.
@@ -665,6 +680,9 @@ class SpeculativeConfig:
             self.draft_parallel_config = self.target_parallel_config
         elif self.method == "suffix":
             self._validate_suffix_decoding()
+        elif self.method == "sparse_attn":
+            # Self-speculative decoding; no separate draft model.
+            pass
         elif self.method == "custom_class":
             # Custom class proposer does not need a draft model.
             # It will dynamically load the user-provided class at runtime.
@@ -1124,6 +1142,9 @@ class SpeculativeConfig:
     def use_ngram_gpu(self) -> bool:
         return self.method == "ngram_gpu"
 
+    def use_sparse_attn(self) -> bool:
+        return self.method == "sparse_attn"
+
     def __repr__(self) -> str:
         method = self.method
         model = (
@@ -1134,6 +1155,7 @@ class SpeculativeConfig:
                 "suffix",
                 "extract_hidden_states",
                 "custom_class",
+                "sparse_attn",
             )
             else self.draft_model_config.model
         )
